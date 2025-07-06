@@ -1,3 +1,4 @@
+
 import { useState, useMemo, useCallback } from 'react';
 import { Client, ClientWithStatus, ClientStatus, FilterOption, SortOption, HistoryEntry } from '../types';
 
@@ -173,8 +174,8 @@ export const useClientManager = () => {
       });
   }, []);
 
-  const restoreState = useCallback((data: { clients: Client[], history: HistoryEntry[] }) => {
-    const newEntry = createHistoryEntry('Sistema', 'Sistema', 'Backup restaurado com sucesso.');
+  const restoreState = useCallback((data: { clients: Client[], history: HistoryEntry[] }, message: string = 'Backup restaurado com sucesso.') => {
+    const newEntry = createHistoryEntry('Sistema', 'Sistema', message);
     setAppState({
         clients: data.clients,
         history: [newEntry, ...data.history],
