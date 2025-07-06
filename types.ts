@@ -45,6 +45,4 @@ export interface AppSettings {
     recoveryKey: string;
     panelTitle: string;
     logoUrl: string;
-    cloudSyncEnabled: boolean;
-    cloudSyncId: string | null;
 }
