@@ -1,5 +1,5 @@
 {
-  "name": "gerenciador-de-clientes-pro",
+  "name": "copy-of-gerenciador-de-clientes-pro-novo",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -12,7 +12,10 @@
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "@google/genai": "^1.8.0",
-    "react-hook-form": "^7.60.0"
+    "react-hook-form": "^7.60.0",
+    "firebase/app": "10.12.2",
+    "firebase/database": "10.12.2",
+    "firebase": "^11.10.0"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",

@@ -1,7 +1,8 @@
 
-import React, { useState, useEffect } from 'react';
+
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { useClientManager } from './hooks/useClientManager';
-import { Client, ClientWithStatus, FilterOption, SortOption, AppSettings } from './types';
+import { Client, ClientWithStatus, FilterOption, SortOption, AppSettings, HistoryEntry } from './types';
 import ClientTable from './components/ClientTable';
 import ClientFormModal from './components/ClientFormModal';
 import Dashboard from './components/Dashboard';
@@ -10,17 +11,44 @@ import SettingsModal from './components/SettingsModal';
 import HistoryModal from './components/HistoryModal';
 import RecoveryModal from './components/RecoveryModal';
 import ConfirmModal from './components/ui/ConfirmModal';
+import SyncPasswordModal, { SyncModalMode } from './components/SyncPasswordModal';
+import SyncTutorialModal from './components/SyncTutorialModal';
+import FirebaseSetupModal from './components/FirebaseSetupModal';
 import { ToastProvider, useToast } from './components/ui/Toast';
 import { exportToExcel } from './services/exportService';
+import { createCloudBin, getCloudBin, updateCloudBin } from './services/cloudSyncService';
+import { encryptData, decryptData } from './services/cryptoService';
+import { checkFirebaseConfig } from './services/firebaseService';
 
 import Button from './components/ui/Button';
 import Input from './components/ui/Input';
-import { AddIcon, SearchIcon, ExportIcon, LogoutIcon, AiIcon, SettingsIcon, HistoryIcon } from './components/icons';
+import { AddIcon, SearchIcon, ExportIcon, LogoutIcon, AiIcon, SettingsIcon, HistoryIcon, CloudIcon, FirebaseIcon } from './components/icons';
 
 const APP_PASSWORD_KEY = 'app_manager_password';
 const APP_SETTINGS_KEY = 'app_manager_settings_v3';
 const APP_DATA_KEY = 'client_manager_data_v2';
 const DEFAULT_PANEL_TITLE = 'Gerenciador de Clientes Pro';
+
+const DAILY_BACKUP_PREFIX = 'client_manager_backup_';
+const MAX_BACKUP_DAYS = 3;
+
+const getBackupDateString = (date: Date): string => {
+    return date.toISOString().split('T')[0];
+};
+
+const useDebounce = (value: any, delay: number) => {
+    const [debouncedValue, setDebouncedValue] = useState(value);
+    useEffect(() => {
+        const handler = setTimeout(() => {
+            setDebouncedValue(value);
+        }, delay);
+        return () => {
+            clearTimeout(handler);
+        };
+    }, [value, delay]);
+    return debouncedValue;
+};
+
 
 const AppContent: React.FC = () => {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -28,12 +56,24 @@ const AppContent: React.FC = () => {
   const [isSettingsModalOpen, setSettingsModalOpen] = useState(false);
   const [isHistoryModalOpen, setHistoryModalOpen] = useState(false);
   const [isRecoveryModalOpen, setRecoveryModalOpen] = useState(false);
-  const [clientToEdit, setClientToEdit] = useState<ClientWithStatus | null>(null);
+  const [isSyncModalOpen, setIsSyncModalOpen] = useState(false);
+  const [isSyncTutorialOpen, setIsSyncTutorialOpen] = useState(false);
+  const [isFirebaseSetupModalOpen, setFirebaseSetupModalOpen] = useState(false);
+  const [isFirebaseConfigured, setIsFirebaseConfigured] = useState(false);
+  const [syncModalMode, setSyncModalMode] = useState<SyncModalMode>('create');
 
+  const [clientToEdit, setClientToEdit] = useState<ClientWithStatus | null>(null);
   const [clientToDelete, setClientToDelete] = useState<ClientWithStatus | null>(null);
   const [clientToRenew, setClientToRenew] = useState<ClientWithStatus | null>(null);
   const [isResetConfirmOpen, setIsResetConfirmOpen] = useState(false);
+  const [isRestoreSessionConfirmOpen, setIsRestoreSessionConfirmOpen] = useState(false);
   const [pendingRecoveryKey, setPendingRecoveryKey] = useState<string | null>(null);
+  const [isDisconnectConfirmOpen, setIsDisconnectConfirmOpen] = useState(false);
+
+  const [dailyBackups, setDailyBackups] = useState<string[]>([]);
+  const [backupToRestore, setBackupToRestore] = useState<string | null>(null);
+  const [sessionSyncPassword, setSessionSyncPassword] = useState<string | null>(null);
+
 
   const { showToast } = useToast();
   const {
@@ -65,21 +105,101 @@ const AppContent: React.FC = () => {
                   logoUrl: parsed.logoUrl || '',
                   autoBackupEnabled: parsed.autoBackupEnabled !== false,
                   recoveryKey: parsed.recoveryKey || '',
+                  cloudSyncEnabled: parsed.cloudSyncEnabled || false,
+                  cloudSyncId: parsed.cloudSyncId || null,
               };
           }
       } catch { /* Use default */ }
-      return { autoBackupEnabled: true, recoveryKey: '', panelTitle: DEFAULT_PANEL_TITLE, logoUrl: '' };
+      return { 
+          autoBackupEnabled: true, 
+          recoveryKey: '', 
+          panelTitle: DEFAULT_PANEL_TITLE, 
+          logoUrl: '',
+          cloudSyncEnabled: false,
+          cloudSyncId: null,
+      };
   });
+  
+  const [initialSessionState, setInitialSessionState] = useState<typeof appState | null>(null);
+  
+  const debouncedAppState = useDebounce(appState, 1000);
 
   useEffect(() => {
-    if (settings.autoBackupEnabled) {
-      localStorage.setItem(APP_DATA_KEY, JSON.stringify(appState));
+    if (isLoggedIn) {
+        if (settings.cloudSyncEnabled && settings.cloudSyncId && sessionSyncPassword && isFirebaseConfigured) {
+             // Cloud sync is active, encrypt and save to cloud
+             encryptData(debouncedAppState, sessionSyncPassword)
+                .then(encryptedData => {
+                    return updateCloudBin(settings.cloudSyncId!, encryptedData);
+                })
+                .catch(err => {
+                    console.error("Cloud sync failed:", err);
+                    showToast('error', `Sinc. automática falhou: ${err.message}`);
+                });
+        } else {
+             // Local mode, save to localStorage
+             if (settings.autoBackupEnabled) {
+                localStorage.setItem(APP_DATA_KEY, JSON.stringify(debouncedAppState));
+             }
+        }
     }
-  }, [appState, settings.autoBackupEnabled]);
+  }, [debouncedAppState, isLoggedIn, settings.cloudSyncEnabled, settings.cloudSyncId, sessionSyncPassword, settings.autoBackupEnabled, showToast, isFirebaseConfigured]);
+
+
+  useEffect(() => {
+    if (isLoggedIn) {
+        setInitialSessionState(JSON.parse(JSON.stringify(appState)));
+
+        // Manage daily backups (local only)
+        const today = new Date();
+        const todayStr = getBackupDateString(today);
+        const todayBackupKey = `${DAILY_BACKUP_PREFIX}${todayStr}`;
+
+        if (!localStorage.getItem(todayBackupKey)) {
+            const liveData = localStorage.getItem(APP_DATA_KEY);
+            if (liveData) {
+                localStorage.setItem(todayBackupKey, liveData);
+            }
+        }
+
+        const availableBackups: string[] = [];
+        const keysToRemove: string[] = [];
+        
+        for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key && key.startsWith(DAILY_BACKUP_PREFIX)) {
+                const dateStr = key.replace(DAILY_BACKUP_PREFIX, '');
+                const backupDate = new Date(dateStr + 'T00:00:00Z'); // Use Z for UTC
+                const diffTime = today.getTime() - backupDate.getTime();
+                const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+                
+                if (diffDays <= MAX_BACKUP_DAYS) {
+                    if (dateStr !== todayStr) {
+                         availableBackups.push(dateStr);
+                    }
+                } else {
+                    keysToRemove.push(key);
+                }
+            }
+        }
+        
+        keysToRemove.forEach(key => localStorage.removeItem(key));
+        
+        availableBackups.sort((a, b) => b.localeCompare(a));
+        setDailyBackups(availableBackups);
+    } else {
+        setInitialSessionState(null);
+    }
+  }, [isLoggedIn, appState]);
+
 
   useEffect(() => {
     localStorage.setItem(APP_SETTINGS_KEY, JSON.stringify(settings));
   }, [settings]);
+
+  useEffect(() => {
+    setIsFirebaseConfigured(checkFirebaseConfig());
+  }, []);
 
   const handleOpenModal = (client: ClientWithStatus | null = null) => {
     setClientToEdit(client);
@@ -125,13 +245,41 @@ const AppContent: React.FC = () => {
     }
   };
 
-  const handleLogin = () => setIsLoggedIn(true);
-  const handleLogout = () => setIsLoggedIn(false);
+  const handleLogin = async (password: string) => {
+    if (settings.cloudSyncEnabled && settings.cloudSyncId && isFirebaseConfigured) {
+        const encryptedData = await getCloudBin(settings.cloudSyncId);
+        const decryptedData = await decryptData(encryptedData, password);
+
+        if (decryptedData) {
+            restoreState(decryptedData as { clients: Client[], history: HistoryEntry[] }, 'Dados sincronizados da nuvem.');
+            setSessionSyncPassword(password);
+            setIsLoggedIn(true);
+            showToast('success', 'Conectado e sincronizado com a nuvem!');
+        } else {
+            throw new Error('Senha de sincronização incorreta.');
+        }
+    } else {
+        if (password === appPassword) {
+            setIsLoggedIn(true);
+        } else {
+            throw new Error('Senha local incorreta.');
+        }
+    }
+  };
+  const handleLogout = () => {
+    setIsLoggedIn(false);
+    setSessionSyncPassword(null);
+  }
   
   const handleAppReset = () => {
     localStorage.removeItem(APP_DATA_KEY);
     localStorage.removeItem(APP_PASSWORD_KEY);
     localStorage.removeItem(APP_SETTINGS_KEY);
+    Object.keys(localStorage).forEach(key => {
+        if (key.startsWith(DAILY_BACKUP_PREFIX)) {
+            localStorage.removeItem(key);
+        }
+    });
     window.location.reload();
   };
 
@@ -200,12 +348,12 @@ const AppContent: React.FC = () => {
   const handleManualBackup = () => {
       const dataStr = JSON.stringify(appState, null, 2);
       const dataUri = 'data:application/json;charset=utf-8,'+ encodeURIComponent(dataStr);
-      const exportFileDefaultName = `backup_clientes_${new Date().toISOString().split('T')[0]}.json`;
+      const exportFileDefaultName = `dados_clientes_${new Date().toISOString().split('T')[0]}.json`;
       const linkElement = document.createElement('a');
       linkElement.setAttribute('href', dataUri);
       linkElement.setAttribute('download', exportFileDefaultName);
       linkElement.click();
-      showToast('success', 'Backup gerado com sucesso.');
+      showToast('success', 'Arquivo de dados exportado com sucesso.');
   };
 
   const handleRestoreBackup = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -217,14 +365,14 @@ const AppContent: React.FC = () => {
                   const text = e.target?.result;
                   const data = JSON.parse(text as string);
                   if (data.clients && Array.isArray(data.clients) && data.history && Array.isArray(data.history)) {
-                       restoreState(data);
-                       showToast('success', 'Backup restaurado com sucesso!');
+                       restoreState(data, 'Dados importados de arquivo com sucesso!');
+                       showToast('success', 'Dados importados com sucesso!');
                        setSettingsModalOpen(false);
                   } else {
-                     showToast('error', "Arquivo de backup inválido ou corrompido.");
+                     showToast('error', "Arquivo de dados inválido ou corrompido.");
                   }
               } catch (error) {
-                  showToast('error', "Erro ao ler o arquivo de backup.");
+                  showToast('error', "Erro ao ler o arquivo de dados.");
                   console.error(error);
               }
           };
@@ -234,11 +382,92 @@ const AppContent: React.FC = () => {
       }
       if(event.target) event.target.value = '';
   };
+  
+  const handleRestoreSessionRequest = () => {
+    setIsRestoreSessionConfirmOpen(true);
+  };
+  
+  const handleConfirmRestoreSession = () => {
+    if (initialSessionState) {
+        restoreState(initialSessionState, 'Sessão restaurada para o estado de início.');
+        showToast('success', 'Sessão restaurada com sucesso!');
+    }
+    setIsRestoreSessionConfirmOpen(false);
+  };
+
+  const handleRestoreFromDailyBackupRequest = (date: string) => {
+    setBackupToRestore(date);
+  };
+
+  const handleConfirmRestoreFromDailyBackup = () => {
+    if (backupToRestore) {
+        const backupKey = `${DAILY_BACKUP_PREFIX}${backupToRestore}`;
+        const backupData = localStorage.getItem(backupKey);
+        if (backupData) {
+            try {
+                const parsedData = JSON.parse(backupData);
+                if (parsedData.clients && parsedData.history) {
+                    restoreState(parsedData, `Restaurado do backup de ${new Date(backupToRestore+'T00:00:00').toLocaleDateString('pt-BR')}.`);
+                    showToast('success', 'Backup restaurado com sucesso!');
+                    setSettingsModalOpen(false);
+                } else {
+                    showToast('error', "Arquivo de backup diário inválido.");
+                }
+            } catch (e) {
+                showToast('error', 'Erro ao processar o backup diário.');
+            }
+        }
+        setBackupToRestore(null);
+    }
+  };
+
+  // --- Cloud Sync Handlers ---
+  const handleSyncSetup = async (password: string): Promise<string> => {
+    const encryptedData = await encryptData(appState, password);
+    const syncId = await createCloudBin(encryptedData);
+    setSettings(s => ({ ...s, cloudSyncEnabled: true, cloudSyncId: syncId }));
+    setSessionSyncPassword(password);
+    showToast('success', 'Sincronização na nuvem ativada com sucesso!');
+    return syncId;
+  };
+
+  const handleSyncConnect = async (syncId: string, password: string) => {
+    const encryptedData = await getCloudBin(syncId);
+    const decryptedData = await decryptData(encryptedData, password);
+
+    if (decryptedData) {
+      restoreState(decryptedData as { clients: Client[], history: HistoryEntry[] }, 'Dados sincronizados da nuvem.');
+      setSettings(s => ({ ...s, cloudSyncEnabled: true, cloudSyncId: syncId }));
+      setSessionSyncPassword(password);
+      setIsSyncModalOpen(false);
+      showToast('success', 'Conectado com sucesso!');
+    } else {
+      throw new Error('ID de Sincronização ou Senha incorretos.');
+    }
+  };
+
+  const handleDisconnectRequest = () => {
+      setIsDisconnectConfirmOpen(true);
+  };
+  
+  const handleConfirmDisconnect = () => {
+      setSettings(s => ({ ...s, cloudSyncEnabled: false, cloudSyncId: null }));
+      setSessionSyncPassword(null);
+      setIsDisconnectConfirmOpen(false);
+      showToast('info', 'Sincronização na nuvem desativada.');
+  };
+
 
   return (
     <>
       {!isLoggedIn ? (
-        <LoginScreen onLogin={handleLogin} appPassword={appPassword} onForgotPassword={handleForgotPassword} panelTitle={settings.panelTitle} logoUrl={settings.logoUrl}/>
+        <LoginScreen 
+            onLogin={handleLogin} 
+            isCloudSyncConfigured={isFirebaseConfigured && settings.cloudSyncEnabled && !!settings.cloudSyncId}
+            onForgotPassword={handleForgotPassword} 
+            panelTitle={settings.panelTitle} 
+            logoUrl={settings.logoUrl}
+        />
       ) : (
         <div className="min-h-screen bg-gray-900 text-gray-100 p-4 sm:p-6 lg:p-8">
           <div className="max-w-7xl mx-auto">
@@ -247,7 +476,7 @@ const AppContent: React.FC = () => {
                  {settings.logoUrl ? (
                     <img src={settings.logoUrl} alt="Logo" className="w-9 h-9 rounded-full object-cover"/>
                 ) : (
-                    <AiIcon className="w-8 h-8 text-brand-400"/>
+                    settings.cloudSyncEnabled && isFirebaseConfigured ? <FirebaseIcon className="w-8 h-8 text-brand-400"/> : <AiIcon className="w-8 h-8 text-brand-400"/>
                 )}
                 <h1 className="text-3xl font-bold text-gray-100">{settings.panelTitle}</h1>
               </div>
@@ -332,6 +561,32 @@ const AppContent: React.FC = () => {
           onManualBackup={handleManualBackup}
           onRestoreBackup={handleRestoreBackup}
           onRecoveryKeySaveRequest={handleRecoveryKeySaveRequest}
+          onRestoreSessionRequest={handleRestoreSessionRequest}
+          dailyBackups={dailyBackups}
+          onRestoreFromDailyBackupRequest={handleRestoreFromDailyBackupRequest}
+          onEnableSyncRequest={() => { setSyncModalMode('create'); setIsSyncModalOpen(true); }}
+          onConnectSyncRequest={() => { setSyncModalMode('connect'); setIsSyncModalOpen(true); }}
+          onDisconnectRequest={handleDisconnectRequest}
+          onOpenTutorial={() => setIsSyncTutorialOpen(true)}
+          isFirebaseConfigured={isFirebaseConfigured}
+          onOpenFirebaseSetup={() => setFirebaseSetupModalOpen(true)}
+      />
+       <SyncPasswordModal
+        isOpen={isSyncModalOpen}
+        onClose={() => setIsSyncModalOpen(false)}
+        mode={syncModalMode}
+        setMode={setSyncModalMode}
+        onSetup={handleSyncSetup}
+        onConnect={handleSyncConnect}
+        syncId={settings.cloudSyncId}
+      />
+      <SyncTutorialModal 
+        isOpen={isSyncTutorialOpen}
+        onClose={() => setIsSyncTutorialOpen(false)}
+      />
+      <FirebaseSetupModal
+        isOpen={isFirebaseSetupModalOpen}
+        onClose={() => setFirebaseSetupModalOpen(false)}
       />
       <HistoryModal
           isOpen={isHistoryModalOpen}
@@ -366,7 +621,7 @@ const AppContent: React.FC = () => {
       >
         <p>Nenhuma chave de recuperação foi configurada.</p>
         <p className="mt-2 font-bold text-yellow-300">ATENÇÃO: Isto irá APAGAR TODOS os seus dados (clientes, histórico, configurações) e restaurar a senha padrão para "admin".</p>
-        <p className="mt-2">Esta ação não pode ser desfeita. Deseja continuar?</p>
+        <p className="mt-2">Deseja continuar?</p>
       </ConfirmModal>
 
        <ConfirmModal
@@ -391,6 +646,41 @@ const AppContent: React.FC = () => {
       >
         <p>Tem certeza que deseja renovar a assinatura de <strong className="font-bold text-yellow-300">{clientToRenew?.nome}</strong> por 30 dias?</p>
       </ConfirmModal>
+
+      <ConfirmModal
+        isOpen={isRestoreSessionConfirmOpen}
+        onClose={() => setIsRestoreSessionConfirmOpen(false)}
+        onConfirm={handleConfirmRestoreSession}
+        title="Confirmar Restauração da Sessão"
+        confirmText="Sim, Restaurar"
+      >
+          <p>Tem certeza que deseja descartar todas as alterações feitas nesta sessão?</p>
+          <p className="mt-2 text-sm text-gray-400">A aplicação será revertida para o estado em que estava quando você fez o login.</p>
+      </ConfirmModal>
+
+       <ConfirmModal
+        isOpen={!!backupToRestore}
+        onClose={() => setBackupToRestore(null)}
+        onConfirm={handleConfirmRestoreFromDailyBackup}
+        title="Confirmar Restauração de Backup"
+        confirmText="Sim, Restaurar"
+        confirmVariant="danger"
+      >
+        <p>Tem certeza que deseja restaurar o backup de <strong className="font-bold text-yellow-300">{backupToRestore && new Date(backupToRestore+'T00:00:00').toLocaleDateString('pt-BR')}</strong>?</p>
+        <p className="mt-2 text-sm text-gray-400">Todos os dados atuais serão substituídos por este backup. Esta ação não pode ser desfeita.</p>
+    </ConfirmModal>
+
+    <ConfirmModal
+        isOpen={isDisconnectConfirmOpen}
+        onClose={() => setIsDisconnectConfirmOpen(false)}
+        onConfirm={handleConfirmDisconnect}
+        title="Confirmar Desconexão da Nuvem"
+        confirmText="Sim, Desconectar"
+        confirmVariant="danger"
+      >
+        <p>Tem certeza que deseja desativar a sincronização na nuvem?</p>
+        <p className="mt-2 text-sm text-gray-400">Seus dados atuais permanecerão neste dispositivo, mas não serão mais sincronizados. Você pode se reconectar mais tarde usando seu ID e senha.</p>
+    </ConfirmModal>
     </>
   );
 };
