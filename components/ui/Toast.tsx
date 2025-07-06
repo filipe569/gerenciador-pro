@@ -1,4 +1,3 @@
-
 import React, { createContext, useContext, useState, useCallback, ReactNode, useEffect } from 'react';
 import { SuccessIcon, ErrorIcon, InfoIcon, CloseIcon } from '../icons';
 
